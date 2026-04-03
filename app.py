@@ -21,7 +21,9 @@ import time
 from pathlib import Path
 from datetime import datetime
 
+import pytz
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, abort, jsonify
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -1012,6 +1014,13 @@ def startup_summary():
 init_db()
 threading.Thread(target=startup_summary, daemon=True).start()
 print("[startup] DB initialized — will send morning summary shortly")
+
+# APScheduler — ส่งสรุปงานทุกเช้า 09:30 จ-ศ เวลาไทย (ไม่ต้องเปิดคอม)
+_tz = pytz.timezone("Asia/Bangkok")
+_scheduler = BackgroundScheduler(timezone=_tz)
+_scheduler.add_job(send_daily_summary, "cron", day_of_week="mon-fri", hour=9, minute=30)
+_scheduler.start()
+print("[scheduler] APScheduler started — daily summary at 09:30 Mon-Fri (Bangkok time)")
 
 if __name__ == "__main__":
     print("LINE Task Bot is running (local)...")
