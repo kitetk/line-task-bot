@@ -3,3 +3,5 @@ requests
 openai
 python-dotenv
 gunicorn
+APScheduler
+pytz
