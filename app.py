@@ -85,6 +85,14 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_date TEXT UNIQUE,
+            summary TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -104,13 +112,20 @@ def db_save_target(target_id: str, target_type: str):
 
 
 def db_get_targets() -> list:
-    """ดึง target IDs ทั้งหมดที่บันทึกไว้"""
+    """ดึง target IDs — ถ้ามีกลุ่มให้ส่งเฉพาะกลุ่ม, ถ้าไม่มีกลุ่มค่อยส่งส่วนตัว"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT target_id FROM targets")
-    rows = [r[0] for r in c.fetchall()]
+    # ลองดึงเฉพาะ group ก่อน
+    c.execute("SELECT target_id FROM targets WHERE target_type = 'group'")
+    groups = [r[0] for r in c.fetchall()]
+    if groups:
+        conn.close()
+        return groups
+    # ถ้าไม่มีกลุ่มเลย fallback ไปส่วนตัว
+    c.execute("SELECT target_id FROM targets WHERE target_type = 'user'")
+    users = [r[0] for r in c.fetchall()]
     conn.close()
-    return rows
+    return users
 
 
 def db_add_task(assign_date, person_name, task_description, due_date):
@@ -169,6 +184,40 @@ def db_delete_all_tasks():
     conn.commit()
     conn.close()
     return affected
+
+
+def db_save_meeting(meeting_date: str, summary: str):
+    """บันทึกหรืออัปเดตสรุปประชุมตามวันที่"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO meetings (meeting_date, summary, created_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(meeting_date) DO UPDATE SET summary=excluded.summary, created_at=excluded.created_at""",
+        (meeting_date, summary, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_meeting(meeting_date: str):
+    """ดึงสรุปประชุมตามวันที่ (คืน None ถ้าไม่พบ)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT meeting_date, summary FROM meetings WHERE meeting_date = ?", (meeting_date,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def db_get_all_meetings():
+    """ดึงสรุปประชุมทั้งหมด"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT meeting_date, summary FROM meetings ORDER BY meeting_date DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 
 # =========================
@@ -298,6 +347,15 @@ def classify_command_fallback(text: str) -> dict:
     for prefix in ["/ลบงาน", "/ลบ", "/delete"]:
         if lower.startswith(prefix):
             return {"intent": "delete_task", "content": t[len(prefix):].strip()}
+
+    # Meeting summary
+    for prefix in ["/สรุปประชุม", "/ประชุม", "/meeting"]:
+        if lower.startswith(prefix):
+            return {"intent": "meeting_summary", "content": t[len(prefix):].strip()}
+
+    # Set group target
+    if lower in ["/ตั้งกลุ่มหลัก", "/setgroup", "/ตั้งกลุ่ม"]:
+        return {"intent": "set_group", "content": ""}
 
     # Default → query (ตัด / ออกแล้วส่งเป็นคำถาม)
     return {"intent": "query", "content": t[1:].strip()}
@@ -717,8 +775,52 @@ HELP_TEXT = """คำสั่งที่ใช้ได้ (พิมพ์ / 
 /ลบงาน ตะไคร้
 /ล้างงานทั้งหมด
 
+สรุปประชุม:
+/สรุปประชุม 3/4/2026 [เนื้อหาสรุป...]  ← บันทึกสรุปประชุม
+/สรุปประชุม 3/4/2026  ← ดูสรุปประชุมวันนั้น
+/สรุปประชุม  ← ดูสรุปประชุมทั้งหมด
+
 ช่วยเหลือ:
 /help หรือ /วิธีใช้"""
+
+
+def handle_meeting_summary(content: str) -> str:
+    """
+    จัดการคำสั่ง /สรุปประชุม
+    - ถ้ามีเนื้อหาหลังวันที่ → บันทึก
+    - ถ้ามีแค่วันที่ → ดึงสรุปประชุมวันนั้น
+    - ถ้าไม่มีอะไรเลย → แสดงสรุปประชุมทั้งหมด
+    """
+    content = content.strip()
+
+    # ไม่มีอะไรเลย → แสดงทั้งหมด
+    if not content:
+        meetings = db_get_all_meetings()
+        if not meetings:
+            return "ยังไม่มีสรุปประชุมในระบบ\nใช้ /สรุปประชุม [วันที่] [เนื้อหา] เพื่อบันทึก"
+        lines = ["📋 สรุปประชุมทั้งหมด:\n"]
+        for date, summary in meetings:
+            lines.append(f"📅 {date}\n{summary}\n{'—'*20}")
+        return "\n".join(lines)[:5000]
+
+    # ตรวจว่าขึ้นต้นด้วยวันที่หรือเปล่า (dd/mm/yyyy หรือ d/m/yy)
+    date_match = re.match(r"^(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)\s*([\s\S]*)", content)
+    if not date_match:
+        return "กรุณาระบุวันที่ก่อน\nตัวอย่าง: /สรุปประชุม 3/4/2026 เนื้อหาสรุป..."
+
+    meeting_date = date_match.group(1).strip()
+    summary_text = date_match.group(2).strip()
+
+    # มีแค่วันที่ ไม่มีเนื้อหา → ดึงสรุปวันนั้น
+    if not summary_text:
+        row = db_get_meeting(meeting_date)
+        if not row:
+            return f"ไม่พบสรุปประชุมวันที่ {meeting_date}\nใช้ /สรุปประชุม {meeting_date} [เนื้อหา] เพื่อบันทึก"
+        return f"📋 สรุปประชุมวันที่ {row[0]}\n\n{row[1]}"
+
+    # มีทั้งวันที่และเนื้อหา → บันทึก
+    db_save_meeting(meeting_date, summary_text)
+    return f"บันทึกสรุปประชุมสำเร็จ!\nวันที่: {meeting_date}\n\n{summary_text}"
 
 
 def handle_add_task(content: str) -> str:
@@ -913,6 +1015,17 @@ def callback():
 
             if intent == "help":
                 reply_message(reply_token, HELP_TEXT)
+
+            elif intent == "set_group":
+                if group_id:
+                    db_save_target(group_id, "group")
+                    reply_message(reply_token, "✅ บันทึกกลุ่มนี้เป็นกลุ่มหลักสำเร็จ!\nบอทจะส่งสรุปงานเช้าเข้ากลุ่มนี้ทุกวัน จ-ศ เวลา 09:30")
+                else:
+                    reply_message(reply_token, "❌ คำสั่งนี้ใช้ได้เฉพาะในกลุ่มแชทเท่านั้นครับ")
+
+            elif intent == "meeting_summary":
+                result = handle_meeting_summary(content)
+                reply_message(reply_token, result)
 
             elif intent == "list_tasks":
                 result = handle_list_tasks(person_filter=content)
