@@ -621,9 +621,9 @@ HELP_TEXT = """คำสั่งที่ใช้ได้ (พิมพ์ / 
 
 
 def _format_task_line(i: int, person: str, task: str, due: str) -> str:
-    due_label = f"ส่ง: {due}" if due and due != "ไม่ระบุ" else "ยังไม่ระบุวันส่ง"
+    due_label = due if due and due != "ไม่ระบุ" else "ไม่ระบุ"
     formatted = format_task_description(task)
-    return f"{i}. {person}  ({due_label})\n   {formatted}"
+    return f"{i}. {person}\n   งาน: {formatted}\n   กำหนดส่ง: {due_label}"
 
 
 def handle_add_task(content: str) -> str:
