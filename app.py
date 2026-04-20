@@ -449,6 +449,11 @@ def parse_task_simple(raw: str):
 
 
 def split_multi_tasks_fallback(raw: str) -> list:
+    """แยกหลายงานเฉพาะเมื่อมี , คั่นเท่านั้น เช่น บาส ทำสไลด์, มะนาว เขียนสรุป"""
+    # ถ้าไม่มีจุลภาค ไม่แยก — ป้องกันตัดงานยาวเป็นชิ้น
+    if "," not in raw:
+        return []
+
     raw = smart_preprocess(raw)
 
     assign_date = today_str()
@@ -457,35 +462,24 @@ def split_multi_tasks_fallback(raw: str) -> list:
         assign_date = m.group(1)
         raw = raw[m.end():].strip()
 
+    # หา global due จาก segment สุดท้าย
     all_dues = list(re.finditer(r"ส่ง\s+(\S+)", raw))
     global_due = all_dues[-1].group(1) if all_dues else "ไม่ระบุ"
 
-    boundaries = list(re.finditer(rf"([ก-๙A-Za-z]+)\s+({_VERB_PAT})", raw))
-    if len(boundaries) < 2:
+    segments = [s.strip() for s in raw.split(",") if s.strip()]
+    if len(segments) < 2:
         return []
 
     results = []
-    for i, bm in enumerate(boundaries):
-        person = bm.group(1)
-        verb   = bm.group(2)
-        end    = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(raw)
-        content = raw[bm.end():end].strip()
+    for seg in segments:
+        task = parse_task_simple(seg)
+        if task:
+            if task["due_date"] == "ไม่ระบุ":
+                task["due_date"] = global_due
+            task["assign_date"] = assign_date
+            results.append(task)
 
-        dm = re.search(r"ส่ง\s+(\S+)", content)
-        if dm:
-            task_due    = dm.group(1)
-            task_content = (content[:dm.start()] + content[dm.end():]).strip()
-        else:
-            task_due    = global_due
-            task_content = content
-
-        results.append({
-            "assign_date": assign_date,
-            "person_name": person,
-            "task_description": f"{verb} {task_content}".strip(),
-            "due_date": task_due,
-        })
-    return results
+    return results if len(results) >= 2 else []
 
 
 def parse_tasks_with_ai(raw: str) -> list:
@@ -500,7 +494,8 @@ def parse_tasks_with_ai(raw: str) -> list:
 กติกา:
 - ถ้าไม่มี assign_date ใช้ "{today_str()}"
 - ถ้าไม่มี due_date ใช้ "ไม่ระบุ"
-- หลายคน/หลายงาน → แยกเป็นหลาย object
+- แยกเป็นหลาย object เฉพาะเมื่อมีจุลภาค , คั่นระหว่างงาน เช่น "บาส ทำสไลด์, มะนาว เขียนสรุป"
+- ถ้าไม่มีจุลภาค ให้ถือว่าเป็นงานเดียว แม้ข้อความจะยาวหรือมีคำกริยาหลายคำ
 - "ตะไคร้ทำสไลด์" → person="ตะไคร้", task="ทำสไลด์"
 - แปลง "พรุ่งนี้"/"วันนี้" เป็น DD/MM/YYYY
 - ถ้าอ่านไม่ได้เลย ตอบ []
