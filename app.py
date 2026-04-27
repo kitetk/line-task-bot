@@ -224,6 +224,35 @@ def db_get_all_meetings():
 
 
 # =========================
+# LINE Profile Helper
+# =========================
+def get_display_name(user_id: str, group_id: str = "") -> str:
+    """
+    ดึง display name ของ user จาก LINE API
+    - กลุ่ม: GET /bot/group/{groupId}/member/{userId}
+    - ส่วนตัว: GET /bot/profile/{userId}
+    คืนชื่อที่ได้ หรือ "" ถ้า error
+    """
+    if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return ""
+    try:
+        headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        if group_id:
+            url = f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+        else:
+            url = f"https://api.line.me/v2/bot/profile/{user_id}"
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            name = r.json().get("displayName", "").strip()
+            print(f"[profile] {user_id} → {name!r}")
+            return name
+        print(f"[profile] error {r.status_code} for {user_id}")
+    except Exception as e:
+        print(f"[profile Error] {e}")
+    return ""
+
+
+# =========================
 # Leave DB Functions
 # =========================
 def db_add_leave(person_name: str, leave_date: str, leave_type: str = "เต็มวัน"):
@@ -889,22 +918,48 @@ def _format_task_line(i: int, person: str, task: str, due: str) -> str:
     return f"{i}. {person}\n   งาน: {formatted}\n   กำหนดส่ง: {due_label}"
 
 
-def handle_add_task(content: str) -> str:
+def handle_add_task(content: str, sender_name: str = "") -> str:
+    """
+    sender_name: display name ของคนส่ง (ดึงจาก LINE API)
+    ถ้า parse ไม่เจอชื่อ และมี sender_name → ใส่ชื่อ sender แทน
+    """
     if not content.strip():
-        return "กรุณาระบุข้อมูลงาน\nตัวอย่าง: /เพิ่มงาน ตะไคร้ ทำสไลด์ ส่ง 5/4"
+        return ("กรุณาระบุงาน\n"
+                "ตัวอย่าง:\n"
+                "  /เพิ่มงาน ทำสไลด์ ส่ง 5/4       ← ใช้ชื่อ LINE ของคุณอัตโนมัติ\n"
+                "  /เพิ่มงาน บาส ทำสไลด์ ส่ง 5/4   ← ระบุชื่อเองได้")
 
+    # ลองดึงชื่อจาก content ก่อน
     parsed = parse_tasks(content)
+
+    # ถ้า parse ได้ 1 งาน แต่ person_name เป็นคำที่ดูเหมือน task verb (ไม่ใช่ชื่อ)
+    # → เติม sender_name นำหน้าแล้ว parse ใหม่
+    if not parsed and sender_name:
+        parsed = parse_tasks(f"{sender_name} {content}")
+    elif parsed and sender_name:
+        # ถ้า person_name ดูเหมือน task verb (ขึ้นต้นด้วย ทำ/เขียน/สรุป/เตรียม ฯลฯ)
+        first_person = parsed[0]["person_name"]
+        task_verbs_start = ("ทำ","เขียน","สรุป","เตรียม","แก้","ออกแบบ","ดีไซน์",
+                            "ตรวจ","นำเสนอ","จัด","อัปเดต","ส่ง","update","make",
+                            "write","prepare","design","fix","check","review")
+        if any(first_person.startswith(v) for v in task_verbs_start):
+            # person_name คือ task จริงๆ — reparse โดยใส่ sender ข้างหน้า
+            reparsed = parse_tasks(f"{sender_name} {content}")
+            if reparsed:
+                parsed = reparsed
+
     if not parsed:
-        return "ไม่สามารถอ่านข้อมูลได้\nลองพิมพ์ให้มีชื่อคน + งาน + ส่ง + วันที่"
+        return "ไม่สามารถอ่านข้อมูลได้\nลองพิมพ์ชื่องานให้ชัดขึ้น เช่น  /เพิ่มงาน ทำสไลด์ ส่ง 5/4"
 
     for item in parsed:
         db_add_task(item["assign_date"], item["person_name"],
                     item["task_description"], item["due_date"])
 
+    auto_label = " (ชื่อจาก LINE)" if sender_name and parsed[0]["person_name"] == sender_name else ""
     if len(parsed) == 1:
         t = parsed[0]
         return (f"✅ บันทึกงานสำเร็จ!\n"
-                f"ชื่อ: {t['person_name']}\n"
+                f"ชื่อ: {t['person_name']}{auto_label}\n"
                 f"งาน: {t['task_description']}\n"
                 f"ส่ง: {t['due_date']}")
 
@@ -1002,20 +1057,29 @@ def handle_meeting_summary(content: str) -> str:
 # =========================
 # Leave Handlers
 # =========================
-def handle_add_leave(content: str) -> str:
+def handle_add_leave(content: str, sender_name: str = "") -> str:
+    """
+    ถ้าไม่พิมชื่อ → ใช้ sender_name (ชื่อ LINE ของคนส่ง) อัตโนมัติ
+    """
     if not content.strip():
-        return ("กรุณาระบุชื่อและวันลา\n"
+        return ("กรุณาระบุวันลา\n"
                 "ตัวอย่าง:\n"
-                "  /ลา ตะไค้ 27/4/69          ← เต็มวัน\n"
-                "  /ลาเช้า ตะไค้ 27/4/69       ← ครึ่งเช้า\n"
-                "  /ลาบ่าย ตะไค้ 27/4/69       ← ครึ่งบ่าย\n"
-                "  /ลา ตะไค้ 12-14 พฤษภา 69   ← หลายวัน")
+                "  /ลา 27/4/69                 ← ใช้ชื่อ LINE ของคุณ\n"
+                "  /ลาเช้า 27/4/69             ← ครึ่งเช้า\n"
+                "  /ลาบ่าย 27/4/69             ← ครึ่งบ่าย\n"
+                "  /ลา 12-14 พฤษภา 69         ← หลายวัน\n"
+                "  /ลา ตะไค้ 27/4/69           ← ระบุชื่อเองได้")
     result = parse_leave_input(content)
+
+    # ถ้า parse ไม่เจอชื่อ และมี sender_name → เติมชื่อ sender นำหน้า
+    if not result and sender_name:
+        result = parse_leave_input(f"{sender_name} {content}")
+
     if not result:
         return ("ไม่สามารถอ่านวันที่ได้\nตัวอย่าง:\n"
-                "  /ลา ตะไค้ 27/4/69\n"
-                "  /ลาเช้า ตะไค้ 27/4/69\n"
-                "  /ลา ตะไค้ 12-14 พฤษภา 69")
+                "  /ลา 27/4/69\n"
+                "  /ลาเช้า 27/4/69\n"
+                "  /ลา 12-14 พฤษภา 69")
     person, dates, leave_type = result
     for d in dates:
         db_add_leave(person, d, leave_type)
@@ -1214,6 +1278,12 @@ def callback():
             content = classified.get("content", "")
             print(f"[webhook] intent={intent} content={content[:60]}")
 
+            # ดึง display name ของคนส่ง (ใช้สำหรับ add_task / add_leave ที่ไม่พิมชื่อ)
+            sender_name = ""
+            if intent in ("add_task", "add_leave"):
+                sender_name = get_display_name(user_id, group_id)
+                print(f"[webhook] sender_name={sender_name!r}")
+
             if intent == "help":
                 reply_message(reply_token, HELP_TEXT)
 
@@ -1243,13 +1313,13 @@ def callback():
 
             elif intent == "add_task":
                 reply_message(reply_token, "กำลังบันทึกงาน...")
-                _c, _sid = content, source_id
-                def _do_add(_c=_c, _sid=_sid):
-                    push_message(_sid, handle_add_task(_c))
+                _c, _sid, _sn = content, source_id, sender_name
+                def _do_add(_c=_c, _sid=_sid, _sn=_sn):
+                    push_message(_sid, handle_add_task(_c, sender_name=_sn))
                 threading.Thread(target=_do_add, daemon=True).start()
 
             elif intent == "add_leave":
-                reply_message(reply_token, handle_add_leave(content))
+                reply_message(reply_token, handle_add_leave(content, sender_name=sender_name))
 
             elif intent == "list_leaves":
                 reply_message(reply_token, handle_list_leaves())
