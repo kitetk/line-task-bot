@@ -153,10 +153,16 @@ def db_get_all_tasks():
 
 
 def db_delete_tasks_by_person(person_name):
+    """ลบงานทั้งหมดของคนที่ชื่อตรง — ใช้ Python matching รองรับชื่อพิเศษ/emoji"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM tasks WHERE person_name LIKE ?", (f"%{normalize_name(person_name)}%",))
-    n = c.rowcount
+    c.execute("SELECT id, person_name FROM tasks")
+    rows = c.fetchall()
+    ids_to_delete = [row[0] for row in rows if name_match(row[1], person_name)]
+    n = 0
+    for tid in ids_to_delete:
+        c.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+        n += 1
     conn.commit()
     conn.close()
     return n
@@ -173,16 +179,17 @@ def db_delete_all_tasks():
 
 
 def db_find_tasks_by_person_keyword(person_name: str, keyword: str) -> list:
+    """ค้นหางานด้วย Python matching รองรับชื่อพิเศษ/emoji/NFC/NFD"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT id, assign_date, person_name, task_description, due_date"
-        " FROM tasks WHERE person_name LIKE ? AND task_description LIKE ? ORDER BY id ASC",
-        (f"%{normalize_name(person_name)}%", f"%{keyword}%")
-    )
+    c.execute("SELECT id, assign_date, person_name, task_description, due_date FROM tasks ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
-    return rows
+    kw = keyword.lower().strip()
+    return [
+        row for row in rows
+        if name_match(row[2], person_name) and kw in row[3].lower()
+    ]
 
 
 def db_delete_task_by_id(task_id: int) -> bool:
@@ -227,29 +234,38 @@ def db_get_all_meetings():
 # =========================
 # LINE Profile Helper
 # =========================
-def get_display_name(user_id: str, group_id: str = "") -> str:
+def get_display_name(user_id: str, group_id: str = "", room_id: str = "") -> str:
     """
     ดึง display name ของ user จาก LINE API
-    - กลุ่ม: GET /bot/group/{groupId}/member/{userId}
-    - ส่วนตัว: GET /bot/profile/{userId}
-    คืนชื่อที่ได้ หรือ "" ถ้า error
+    รองรับ: group, room, และ 1-on-1
+    คืน normalized name หรือ "" ถ้า error
     """
     if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        print("[profile] skip — missing user_id or token")
         return ""
-    try:
-        headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-        if group_id:
-            url = f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
-        else:
-            url = f"https://api.line.me/v2/bot/profile/{user_id}"
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            name = normalize_name(r.json().get("displayName", ""))
-            print(f"[profile] {user_id} → {name!r}")
-            return name
-        print(f"[profile] error {r.status_code} for {user_id}")
-    except Exception as e:
-        print(f"[profile Error] {e}")
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    # ลองทุก endpoint ตามลำดับ
+    endpoints = []
+    if group_id:
+        endpoints.append(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}")
+    if room_id:
+        endpoints.append(f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}")
+    endpoints.append(f"https://api.line.me/v2/bot/profile/{user_id}")
+
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers=headers, timeout=5)
+            print(f"[profile] GET {url} → {r.status_code}")
+            if r.status_code == 200:
+                raw  = r.json().get("displayName", "")
+                name = normalize_name(raw)
+                print(f"[profile] raw={raw!r} normalized={name!r}")
+                return name
+            if r.status_code == 404:
+                continue   # ลอง endpoint ถัดไป
+            print(f"[profile] error body: {r.text[:200]}")
+        except Exception as e:
+            print(f"[profile Error] {url} → {e}")
     return ""
 
 
@@ -1260,6 +1276,57 @@ def debug_summary():
     return "summary sent", 200
 
 
+@app.route("/debug/profile", methods=["GET"])
+def debug_profile():
+    """
+    ทดสอบดึงชื่อจาก LINE API
+    ใช้: GET /debug/profile?uid=Uxxxx&gid=Cxxxx
+    """
+    uid = request.args.get("uid", "")
+    gid = request.args.get("gid", "")
+    rid = request.args.get("rid", "")
+    if not uid:
+        return jsonify({"error": "ต้องส่ง ?uid=<userId>"}), 400
+    name = get_display_name(uid, gid, rid)
+    import unicodedata
+    return jsonify({
+        "userId": uid,
+        "groupId": gid or None,
+        "roomId":  rid or None,
+        "displayName": name,
+        "displayName_repr": repr(name),
+        "len": len(name),
+        "normalization": "NFC",
+        "codepoints": [f"U+{ord(c):04X} ({unicodedata.name(c, '?')})" for c in name],
+    })
+
+
+@app.route("/debug/names", methods=["GET"])
+def debug_names():
+    """แสดงชื่อทั้งหมดใน DB พร้อม repr เพื่อดู encoding"""
+    import unicodedata
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT person_name FROM tasks ORDER BY person_name")
+    task_names = [r[0] for r in c.fetchall()]
+    c.execute("SELECT DISTINCT person_name FROM leaves ORDER BY person_name")
+    leave_names = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    def info(n):
+        return {
+            "name": n,
+            "repr": repr(n),
+            "len": len(n),
+            "codepoints": [f"U+{ord(ch):04X}" for ch in n],
+        }
+
+    return jsonify({
+        "task_persons":  [info(n) for n in task_names],
+        "leave_persons": [info(n) for n in leave_names],
+    })
+
+
 # =========================
 # Webhook
 # =========================
@@ -1284,8 +1351,9 @@ def callback():
             reply_token = event.get("replyToken", "")
             source      = event.get("source", {})
             group_id    = source.get("groupId", "")
+            room_id     = source.get("roomId", "")
             user_id     = source.get("userId", "")
-            source_id   = group_id or user_id
+            source_id   = group_id or room_id or user_id
 
             if not text.startswith("/"):
                 continue
@@ -1304,8 +1372,8 @@ def callback():
             # ดึง display name ของคนส่ง (ใช้สำหรับ add_task / add_leave ที่ไม่พิมชื่อ)
             sender_name = ""
             if intent in ("add_task", "add_leave"):
-                sender_name = get_display_name(user_id, group_id)
-                print(f"[webhook] sender_name={sender_name!r}")
+                sender_name = get_display_name(user_id, group_id, room_id)
+                print(f"[webhook] sender_name={sender_name!r} (uid={user_id[:8]}... gid={group_id[:8] if group_id else '-'})")
 
             if intent == "help":
                 reply_message(reply_token, HELP_TEXT)
