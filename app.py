@@ -17,6 +17,7 @@ import base64
 import sqlite3
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 
@@ -136,7 +137,7 @@ def db_add_task(assign_date, person_name, task_description, due_date):
     conn.execute(
         "INSERT INTO tasks (assign_date, person_name, task_description, due_date, created_at)"
         " VALUES (?, ?, ?, ?, ?)",
-        (assign_date, person_name, task_description, due_date, _now())
+        (assign_date, normalize_name(person_name), task_description, due_date, _now())
     )
     conn.commit()
     conn.close()
@@ -154,7 +155,7 @@ def db_get_all_tasks():
 def db_delete_tasks_by_person(person_name):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM tasks WHERE person_name LIKE ?", (f"%{person_name}%",))
+    c.execute("DELETE FROM tasks WHERE person_name LIKE ?", (f"%{normalize_name(person_name)}%",))
     n = c.rowcount
     conn.commit()
     conn.close()
@@ -177,7 +178,7 @@ def db_find_tasks_by_person_keyword(person_name: str, keyword: str) -> list:
     c.execute(
         "SELECT id, assign_date, person_name, task_description, due_date"
         " FROM tasks WHERE person_name LIKE ? AND task_description LIKE ? ORDER BY id ASC",
-        (f"%{person_name}%", f"%{keyword}%")
+        (f"%{normalize_name(person_name)}%", f"%{keyword}%")
     )
     rows = c.fetchall()
     conn.close()
@@ -243,7 +244,7 @@ def get_display_name(user_id: str, group_id: str = "") -> str:
             url = f"https://api.line.me/v2/bot/profile/{user_id}"
         r = requests.get(url, headers=headers, timeout=5)
         if r.status_code == 200:
-            name = r.json().get("displayName", "").strip()
+            name = normalize_name(r.json().get("displayName", ""))
             print(f"[profile] {user_id} → {name!r}")
             return name
         print(f"[profile] error {r.status_code} for {user_id}")
@@ -259,7 +260,7 @@ def db_add_leave(person_name: str, leave_date: str, leave_type: str = "เต็
     conn = get_conn()
     conn.execute(
         "INSERT INTO leaves (person_name, leave_date, leave_type, created_at) VALUES (?, ?, ?, ?)",
-        (person_name, leave_date, leave_type, _now())
+        (normalize_name(person_name), leave_date, leave_type, _now())
     )
     conn.commit()
     conn.close()
@@ -289,7 +290,7 @@ def db_get_leaves_by_date(date_str: str) -> list:
 def db_delete_leave_by_person(person_name: str) -> int:
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM leaves WHERE person_name LIKE ?", (f"%{person_name}%",))
+    c.execute("DELETE FROM leaves WHERE person_name LIKE ?", (f"%{normalize_name(person_name)}%",))
     n = c.rowcount
     conn.commit()
     conn.close()
@@ -367,6 +368,28 @@ def _now() -> str:
 
 def today_str() -> str:
     return datetime.now().strftime("%d/%m/%Y")
+
+
+def normalize_name(name: str) -> str:
+    """
+    Normalize ชื่อ LINE ให้พร้อมใช้งาน:
+    1. NFC normalization — แก้ fërň NFD vs NFC ไม่ตรงกัน
+    2. รองรับ emoji ในชื่อ เช่น 🌟kite, fërň🌸 (ไม่ตัดออก เก็บไว้ครบ)
+    3. strip whitespace
+    ใช้ทุกที่ที่เกี่ยวกับชื่อ: บันทึก / ค้นหา / แสดงผล
+    """
+    if not name:
+        return name
+    # NFC รวม combining characters เข้ากับ base character
+    name = unicodedata.normalize("NFC", name)
+    # strip leading/trailing whitespace และ zero-width characters
+    name = name.strip().strip("\u200b\u200c\u200d\ufeff")
+    return name
+
+
+def name_match(stored: str, query: str) -> bool:
+    """เปรียบเทียบชื่อแบบ case-insensitive + NFC-normalized"""
+    return normalize_name(query).lower() in normalize_name(stored).lower()
 
 
 def normalize_spaces(text: str) -> str:
@@ -734,7 +757,7 @@ def parse_task_simple(raw: str):
 
         return {
             "assign_date": assign_date,
-            "person_name": person_name.strip(),
+            "person_name": normalize_name(person_name.strip()),
             "task_description": task_description.strip(),
             "due_date": due_date.strip() or "ไม่ระบุ",
         }
@@ -975,7 +998,7 @@ def handle_list_tasks(person_filter: str = "") -> str:
         return "ยังไม่มีงานในระบบ\nใช้ /เพิ่มงาน เพื่อเพิ่มงาน"
 
     if person_filter:
-        tasks = [t for t in tasks if person_filter.lower() in t[1].lower()]
+        tasks = [t for t in tasks if name_match(t[1], person_filter)]
         if not tasks:
             return f"ไม่พบงานของ '{person_filter}'"
 
