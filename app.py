@@ -84,6 +84,14 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS leaves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_name TEXT,
+            leave_date TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -208,6 +216,69 @@ def db_get_all_meetings():
 
 
 # =========================
+# Leave DB Functions
+# =========================
+def db_add_leave(person_name: str, leave_date: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO leaves (person_name, leave_date, created_at) VALUES (?, ?, ?)",
+        (person_name, leave_date, _now())
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_all_leaves() -> list:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, person_name, leave_date FROM leaves ORDER BY leave_date ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def db_get_leaves_by_date(date_str: str) -> list:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, person_name, leave_date FROM leaves WHERE leave_date = ?", (date_str,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def db_delete_leave_by_person(person_name: str) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM leaves WHERE person_name LIKE ?", (f"%{person_name}%",))
+    n = c.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def db_delete_expired_leaves():
+    """ลบวันลาที่ผ่านมาแล้ว (วันที่ < วันนี้)"""
+    today = datetime.now(pytz.timezone("Asia/Bangkok")).date()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, leave_date FROM leaves")
+    rows = c.fetchall()
+    deleted = 0
+    for lid, ldate_str in rows:
+        try:
+            parts = ldate_str.split("/")
+            d = datetime(int(parts[2]), int(parts[1]), int(parts[0])).date()
+            if d < today:
+                c.execute("DELETE FROM leaves WHERE id = ?", (lid,))
+                deleted += 1
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    print(f"[leave cleanup] deleted {deleted} expired leave(s)")
+
+
+# =========================
 # LINE API
 # =========================
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -302,6 +373,153 @@ def extract_json_array(text: str):
 # =========================
 # Rule-based Classifier
 # =========================
+# =========================
+# Leave Date Parser  (รองรับหลายวัน + ช่วงวัน + เดือนภาษาไทย)
+# =========================
+THAI_MONTHS = {
+    "มกรา": 1,  "มกราคม": 1,
+    "กุมภา": 2,  "กุมภาพันธ์": 2,
+    "มีนา": 3,   "มีนาคม": 3,
+    "เมษา": 4,   "เมษายน": 4,
+    "พฤษภา": 5,  "พฤษภาคม": 5,
+    "มิถุนา": 6, "มิถุนายน": 6,
+    "กรกฎา": 7,  "กรกฎาคม": 7,
+    "สิงหา": 8,  "สิงหาคม": 8,
+    "กันยา": 9,  "กันยายน": 9,
+    "ตุลา": 10,  "ตุลาคม": 10,
+    "พฤศจิกา": 11, "พฤศจิกายน": 11,
+    "ธันวา": 12, "ธันวาคม": 12,
+}
+
+
+def _year_to_ce(year_raw: str | None) -> int:
+    """แปลงปีเป็น ค.ศ. รองรับ พ.ศ. 2/4 หลัก"""
+    now = datetime.now(pytz.timezone("Asia/Bangkok"))
+    if year_raw is None:
+        return now.year
+    y = int(year_raw)
+    if len(str(year_raw)) <= 2:
+        y += 2500      # 2 หลัก → พ.ศ. 25xx
+    if y >= 2500:
+        y -= 543       # พ.ศ. → ค.ศ.
+    return y
+
+
+def parse_leave_date(raw: str) -> str | None:
+    """
+    DD/MM/YYYY, DD/MM/YY (พ.ศ.), DD/MM/BBBB (พ.ศ.), DD/MM
+    คืน DD/MM/YYYY (ค.ศ.) หรือ None
+    """
+    raw = raw.strip().replace("-", "/")
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", raw)
+    if not m:
+        return None
+    day, mon = int(m.group(1)), int(m.group(2))
+    year_ce = _year_to_ce(m.group(3))
+    try:
+        return datetime(year_ce, mon, day).strftime("%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def _expand_days(day_part: str) -> list[int]:
+    """
+    แปลง day_part → list ของวันที่
+    รองรับ: "12"  "12 13 14"  "12-14"  "12,13,14"
+    """
+    day_part = day_part.strip()
+    # ช่วงวัน เช่น 12-14
+    m_range = re.match(r"^(\d{1,2})\s*[-–]\s*(\d{1,2})$", day_part)
+    if m_range:
+        s, e = int(m_range.group(1)), int(m_range.group(2))
+        return list(range(s, e + 1)) if s <= e else []
+    # หลายวันคั่นด้วย space หรือ comma
+    nums = re.findall(r"\d{1,2}", day_part)
+    return [int(n) for n in nums] if nums else []
+
+
+def parse_leave_input(content: str) -> tuple[str, list[str]] | None:
+    """
+    แยก ชื่อ + รายการวันลา จาก content หลัง /ลา
+    รองรับ:
+      "ตะไค้ 27/4/69"              → 1 วัน
+      "ตะไค้ 12 13 14 พฤษภา 69"   → 3 วัน (เดือนไทย + ปี พ.ศ.)
+      "ตะไค้ 12-14 พฤษภา"          → range 3 วัน (ปีปัจจุบัน)
+      "ตะไค้ 12/5 13/5 14/5"       → 3 วัน (DD/MM)
+      "ตะไค้ 12/5/69 13/5/69"      → 3 วัน (full date)
+    คืน (person_name, [date_str, ...]) หรือ None
+    """
+    content = content.strip()
+    now = datetime.now(pytz.timezone("Asia/Bangkok"))
+
+    # ── รูปแบบ 1: มีชื่อเดือนภาษาไทย ───────────────────────────────────────
+    # ค้นหาชื่อเดือนไทยใน content
+    thai_month_found = None
+    month_pos = None
+    for th_name in sorted(THAI_MONTHS.keys(), key=len, reverse=True):
+        idx = content.find(th_name)
+        if idx != -1:
+            thai_month_found = THAI_MONTHS[th_name]
+            month_pos = idx
+            month_end = idx + len(th_name)
+            break
+
+    if thai_month_found is not None:
+        before_month = content[:month_pos].strip()   # "ตะไค้ 12 13 14" หรือ "ตะไค้ 12-14"
+        after_month  = content[month_end:].strip()   # "69" หรือ ""
+
+        # แยกชื่อออกจาก day_part
+        # ชื่อคือส่วนที่ไม่ใช่ตัวเลข/ขีด ก่อนตัวเลขแรก
+        m_name = re.match(r"^([^\d]+?)\s+([\d\s\-–,]+)$", before_month)
+        if m_name:
+            person    = m_name.group(1).strip()
+            day_part  = m_name.group(2).strip()
+        else:
+            # อาจเป็นแค่ชื่อ (ไม่มีวันก่อนเดือน) — ลองหาวันหลังเดือน
+            person = before_month
+            day_part = ""
+
+        # หาปี จาก after_month
+        year_m = re.search(r"\b(\d{2,4})\b", after_month)
+        year_ce = _year_to_ce(year_m.group(1) if year_m else None)
+        mon = thai_month_found
+
+        # ถ้า day_part ว่าง ลองหาตัวเลขใน after_month ก่อนปี
+        if not day_part.strip():
+            nums_after = re.findall(r"\d{1,2}", after_month)
+            if nums_after and (not year_m or nums_after[0] != year_m.group(1)):
+                day_part = nums_after[0]
+
+        days = _expand_days(day_part)
+        if not person or not days:
+            return None
+
+        dates = []
+        for d in days:
+            try:
+                dates.append(datetime(year_ce, mon, d).strftime("%d/%m/%Y"))
+            except ValueError:
+                pass
+        return (person, dates) if dates else None
+
+    # ── รูปแบบ 2: DD/MM(/YY/YYYY) หลายชุด ─────────────────────────────────
+    # หา pattern วันที่ทุกอัน
+    date_matches = list(re.finditer(r"\b(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)\b", content))
+    if date_matches:
+        # ชื่อ = ทุกอย่างก่อน pattern วันที่แรก
+        person = content[:date_matches[0].start()].strip()
+        if not person:
+            return None
+        dates = []
+        for dm in date_matches:
+            d = parse_leave_date(dm.group(1))
+            if d:
+                dates.append(d)
+        return (person, dates) if dates else None
+
+    return None
+
+
 def classify_command_fallback(text: str) -> dict:
     t = text.strip()
     lo = t.lower()
@@ -319,6 +537,19 @@ def classify_command_fallback(text: str) -> dict:
     if lo.startswith("/งานของ"):
         return {"intent": "list_tasks", "content": t[len("/งานของ"):].strip()}
 
+    # ─── Leave commands (ต้องอยู่ก่อน /ลบ เพื่อป้องกัน /ลบวันลา ชน /ลบ) ──────
+    for p in ["/ลบวันลา", "/ยกเลิกลา", "/ยกเลิกวันลา"]:
+        if lo.startswith(p):
+            return {"intent": "delete_leave", "content": t[len(p):].strip()}
+
+    if lo in ["/ดูวันลา", "/วันลา", "/รายการลา", "/ลาทั้งหมด"]:
+        return {"intent": "list_leaves", "content": ""}
+
+    for p in ["/แจ้งลา", "/ลางาน", "/ลา"]:
+        if lo.startswith(p):
+            return {"intent": "add_leave", "content": t[len(p):].strip()}
+
+    # ─── Task commands ────────────────────────────────────────────────────────
     if lo in ["/ล้างงานทั้งหมด", "/ล้างทั้งหมด", "/ล้าง", "/deleteall"]:
         return {"intent": "delete_all", "content": ""}
 
@@ -589,29 +820,29 @@ def answer_question(question: str, tasks_data: list) -> str:
 # =========================
 HELP_TEXT = """คำสั่งที่ใช้ได้ (พิมพ์ / นำหน้าเสมอ)
 
-เพิ่มงาน:
-/เพิ่มงาน ตะไคร้ ทำสไลด์ learntoearn ส่ง 5/4/2026
+📋 งาน:
+/เพิ่มงาน ตะไคร้ ทำสไลด์ ส่ง 5/4/2026
 /เพิ่มงาน บาส ทำรายงาน, มะนาว เขียนสรุป ส่ง 7/4
-
-ดูงาน:
 /งานทั้งหมด
 /งานของตะไคร้
-/ตะไคร้ต้องทำอะไรบ้าง
-
-งานเสร็จ:
-/เสร็จ ตะไคร้ สไลด์  ← ชื่อ + keyword ของงาน
-
-ลบงาน:
+/เสร็จ ตะไคร้ สไลด์
 /ลบงาน ตะไคร้
 /ล้างงานทั้งหมด
 
-สรุปประชุม:
+🏖️ วันลา:
+/ลา ตะไค้ 27/4/69          ← 1 วัน (พ.ศ. 2 หลัก)
+/ลา ตะไค้ 12 13 14 พฤษภา  ← หลายวัน + ชื่อเดือนไทย
+/ลา ตะไค้ 12-14 พฤษภา 69  ← ช่วงวัน + เดือนไทย + ปี
+/ดูวันลา                    ← ดูวันลาทั้งหมด
+/ลบวันลา ตะไค้              ← ลบ/แก้ไขวันลา
+
+📅 สรุปประชุม:
 /สรุปประชุม 3/4/2026 เนื้อหา...  ← บันทึก
 /สรุปประชุม 3/4/2026  ← ดูวันนั้น
 /สรุปประชุม  ← ดูทั้งหมด
 
-ตั้งค่า:
-/ตั้งกลุ่มหลัก  ← ให้บอทส่งสรุปเช้าเข้ากลุ่มนี้
+⚙️ ตั้งค่า:
+/ตั้งกลุ่มหลัก  ← บอทส่งสรุปเช้าเข้ากลุ่มนี้
 /help"""
 
 
@@ -732,6 +963,65 @@ def handle_meeting_summary(content: str) -> str:
 
 
 # =========================
+# Leave Handlers
+# =========================
+def handle_add_leave(content: str) -> str:
+    if not content.strip():
+        return ("กรุณาระบุชื่อและวันลา\n"
+                "ตัวอย่าง:\n"
+                "  /ลา ตะไค้ 27/4/69\n"
+                "  /ลา ตะไค้ 12 13 14 พฤษภา\n"
+                "  /ลา ตะไค้ 12-14 พฤษภา 69")
+    result = parse_leave_input(content)
+    if not result:
+        return ("ไม่สามารถอ่านวันที่ได้\nตัวอย่าง:\n"
+                "  /ลา ตะไค้ 27/4/69\n"
+                "  /ลา ตะไค้ 12 13 14 พฤษภา\n"
+                "  /ลา ตะไค้ 12-14 พฤษภา 69")
+    person, dates = result
+    for d in dates:
+        db_add_leave(person, d)
+
+    if len(dates) == 1:
+        return (f"✅ บันทึกวันลาสำเร็จ!\n"
+                f"ชื่อ: {person}\n"
+                f"วันที่ลา: {dates[0]}\n"
+                f"ระบบแจ้งเตือนวันนั้น และลบอัตโนมัติเมื่อสิ้นวัน")
+
+    day_list = "\n".join(f"  • {d}" for d in dates)
+    return (f"✅ บันทึกวันลาสำเร็จ {len(dates)} วัน!\n"
+            f"ชื่อ: {person}\n"
+            f"วันที่ลา:\n{day_list}\n"
+            f"ระบบแจ้งเตือนแต่ละวัน และลบอัตโนมัติเมื่อสิ้นวัน")
+
+
+def handle_list_leaves() -> str:
+    leaves = db_get_all_leaves()
+    if not leaves:
+        return "ยังไม่มีการแจ้งลาในระบบ\nใช้ /ลา [ชื่อ] [วันที่] เพื่อแจ้งลา"
+    # จัดกลุ่มตามชื่อคน
+    grouped: dict = {}
+    for _, person, leave_date in leaves:
+        grouped.setdefault(person, []).append(leave_date)
+    lines = ["🏖️ รายการวันลาทั้งหมด:"]
+    for person, dates in grouped.items():
+        if len(dates) == 1:
+            lines.append(f"• {person}  —  {dates[0]}")
+        else:
+            lines.append(f"• {person}  —  {', '.join(dates)}  ({len(dates)} วัน)")
+    return "\n".join(lines)
+
+
+def handle_delete_leave(person_name: str) -> str:
+    if not person_name.strip():
+        return "กรุณาระบุชื่อ\nตัวอย่าง: /ลบวันลา ตะไค้"
+    n = db_delete_leave_by_person(person_name.strip())
+    if n > 0:
+        return f"✅ ลบวันลาของ '{person_name.strip()}' สำเร็จ ({n} รายการ)"
+    return f"ไม่พบวันลาของ '{person_name.strip()}'"
+
+
+# =========================
 # Morning Summary
 # =========================
 def send_daily_summary():
@@ -760,6 +1050,46 @@ def send_daily_summary():
     print(f"[summary] sending to {len(targets)} target(s)")
     for target_id in targets:
         push_message(target_id, msg)
+
+
+# =========================
+# Leave Notification & Cleanup
+# =========================
+def send_leave_notification():
+    """
+    ส่ง bubble แยก (ไม่ปนกับ task summary) เตือนวันลาวันนี้
+    ทำงานทุกวัน 09:30 แต่จะส่งเฉพาะวันที่มีการลาเท่านั้น
+    """
+    now = datetime.now(pytz.timezone("Asia/Bangkok"))
+    today = now.strftime("%d/%m/%Y")
+    leaves = db_get_leaves_by_date(today)
+    if not leaves:
+        print("[leave notify] no leave today — skip")
+        return
+
+    targets = db_get_targets()
+    if not targets:
+        print("[leave notify] no targets — skip")
+        return
+
+    day_th = {0:"จันทร์",1:"อังคาร",2:"พุธ",3:"พฤหัสบดี",4:"ศุกร์",
+               5:"เสาร์",6:"อาทิตย์"}[now.weekday()]
+
+    lines = [f"🏖️ แจ้งเตือนวันลา — {day_th} {today}",
+             "——————————————————————"]
+    for _, person, _ in leaves:
+        lines.append(f"• {person} ลางานวันนี้")
+    lines.append("——————————————————————")
+    msg = "\n".join(lines)
+
+    print(f"[leave notify] {len(leaves)} leave(s) today → {len(targets)} target(s)")
+    for target_id in targets:
+        push_message(target_id, msg)
+
+
+def cleanup_expired_leaves():
+    """00:05 เที่ยงคืน — ลบวันลาที่วันที่ < วันนี้"""
+    db_delete_expired_leaves()
 
 
 # =========================
@@ -871,6 +1201,15 @@ def callback():
                     push_message(_sid, handle_add_task(_c))
                 threading.Thread(target=_do_add, daemon=True).start()
 
+            elif intent == "add_leave":
+                reply_message(reply_token, handle_add_leave(content))
+
+            elif intent == "list_leaves":
+                reply_message(reply_token, handle_list_leaves())
+
+            elif intent == "delete_leave":
+                reply_message(reply_token, handle_delete_leave(content))
+
             elif intent == "query":
                 reply_message(reply_token, "กำลังค้นหาข้อมูล...")
                 _q = content or text
@@ -902,10 +1241,23 @@ _scheduler.add_job(
     "cron",
     day_of_week="mon-fri",
     hour=9, minute=30,
-    misfire_grace_time=300   # ถ้า miss ไป 5 นาที ยังส่งได้
+    misfire_grace_time=300
+)
+# ส่งแจ้งเตือนวันลาทุกวัน 09:30 (แยก bubble จาก task summary)
+_scheduler.add_job(
+    send_leave_notification,
+    "cron",
+    hour=9, minute=30,
+    misfire_grace_time=300
+)
+# ลบวันลาที่หมดอายุ — ทุกวันเที่ยงคืน
+_scheduler.add_job(
+    cleanup_expired_leaves,
+    "cron",
+    hour=0, minute=5
 )
 _scheduler.start()
-print("[startup] APScheduler running — daily summary at 09:30 Mon-Fri (Bangkok)")
+print("[startup] APScheduler running — summary+leave at 09:30, cleanup at 00:05 (Bangkok)")
 
 if __name__ == "__main__":
     print("Running locally on http://localhost:5000")
