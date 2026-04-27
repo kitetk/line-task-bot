@@ -89,9 +89,17 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_name TEXT,
             leave_date TEXT,
+            leave_type TEXT DEFAULT 'เต็มวัน',
             created_at TEXT
         )
     """)
+    # migrate: เพิ่ม leave_type ให้ตารางเก่าที่ยังไม่มี column นี้
+    try:
+        c.execute("ALTER TABLE leaves ADD COLUMN leave_type TEXT DEFAULT 'เต็มวัน'")
+        conn.commit()
+        print("[migrate] added leave_type column to leaves table")
+    except Exception:
+        pass  # column มีอยู่แล้ว
     conn.commit()
     conn.close()
 
@@ -218,11 +226,11 @@ def db_get_all_meetings():
 # =========================
 # Leave DB Functions
 # =========================
-def db_add_leave(person_name: str, leave_date: str):
+def db_add_leave(person_name: str, leave_date: str, leave_type: str = "เต็มวัน"):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO leaves (person_name, leave_date, created_at) VALUES (?, ?, ?)",
-        (person_name, leave_date, _now())
+        "INSERT INTO leaves (person_name, leave_date, leave_type, created_at) VALUES (?, ?, ?, ?)",
+        (person_name, leave_date, leave_type, _now())
     )
     conn.commit()
     conn.close()
@@ -231,7 +239,7 @@ def db_add_leave(person_name: str, leave_date: str):
 def db_get_all_leaves() -> list:
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, person_name, leave_date FROM leaves ORDER BY leave_date ASC")
+    c.execute("SELECT id, person_name, leave_date, leave_type FROM leaves ORDER BY leave_date ASC")
     rows = c.fetchall()
     conn.close()
     return rows
@@ -240,7 +248,10 @@ def db_get_all_leaves() -> list:
 def db_get_leaves_by_date(date_str: str) -> list:
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, person_name, leave_date FROM leaves WHERE leave_date = ?", (date_str,))
+    c.execute(
+        "SELECT id, person_name, leave_date, leave_type FROM leaves WHERE leave_date = ?",
+        (date_str,)
+    )
     rows = c.fetchall()
     conn.close()
     return rows
@@ -438,18 +449,36 @@ def _expand_days(day_part: str) -> list[int]:
     return [int(n) for n in nums] if nums else []
 
 
-def parse_leave_input(content: str) -> tuple[str, list[str]] | None:
+def _extract_leave_type(content: str) -> tuple[str, str]:
+    """
+    ดึง leave_type จาก content แล้วคืน (content_cleaned, leave_type)
+    รองรับ: 'เช้า' / 'ครึ่งเช้า' → ครึ่งเช้า
+             'บ่าย' / 'ครึ่งบ่าย' → ครึ่งบ่าย
+             ไม่มี             → เต็มวัน
+    """
+    for kw, ltype in [("ครึ่งเช้า", "ครึ่งเช้า"), ("ครึ่งบ่าย", "ครึ่งบ่าย"),
+                      ("เช้า", "ครึ่งเช้า"), ("บ่าย", "ครึ่งบ่าย")]:
+        if kw in content:
+            cleaned = content.replace(kw, "").strip()
+            cleaned = re.sub(r"\s{2,}", " ", cleaned)
+            return cleaned, ltype
+    return content, "เต็มวัน"
+
+
+def parse_leave_input(content: str) -> tuple[str, list[str], str] | None:
     """
     แยก ชื่อ + รายการวันลา จาก content หลัง /ลา
     รองรับ:
-      "ตะไค้ 27/4/69"              → 1 วัน
-      "ตะไค้ 12 13 14 พฤษภา 69"   → 3 วัน (เดือนไทย + ปี พ.ศ.)
-      "ตะไค้ 12-14 พฤษภา"          → range 3 วัน (ปีปัจจุบัน)
-      "ตะไค้ 12/5 13/5 14/5"       → 3 วัน (DD/MM)
-      "ตะไค้ 12/5/69 13/5/69"      → 3 วัน (full date)
-    คืน (person_name, [date_str, ...]) หรือ None
+      "ตะไค้ 27/4/69"              → 1 วัน (เต็มวัน)
+      "ตะไค้ เช้า 27/4/69"         → ครึ่งเช้า
+      "ตะไค้ บ่าย 12-14 พฤษภา"    → ครึ่งบ่าย 3 วัน
+      "ตะไค้ 12 13 14 พฤษภา 69"   → 3 วัน
+      "ตะไค้ 12/5 13/5 14/5"       → 3 วัน
+    คืน (person_name, [date_str, ...], leave_type) หรือ None
     """
     content = content.strip()
+    # ดึง leave_type ออกก่อนแล้วค่อย parse ชื่อ/วัน
+    content, leave_type = _extract_leave_type(content)
     now = datetime.now(pytz.timezone("Asia/Bangkok"))
 
     # ── รูปแบบ 1: มีชื่อเดือนภาษาไทย ───────────────────────────────────────
@@ -500,7 +529,7 @@ def parse_leave_input(content: str) -> tuple[str, list[str]] | None:
                 dates.append(datetime(year_ce, mon, d).strftime("%d/%m/%Y"))
             except ValueError:
                 pass
-        return (person, dates) if dates else None
+        return (person, dates, leave_type) if dates else None
 
     # ── รูปแบบ 2: DD/MM(/YY/YYYY) หลายชุด ─────────────────────────────────
     # หา pattern วันที่ทุกอัน
@@ -515,7 +544,7 @@ def parse_leave_input(content: str) -> tuple[str, list[str]] | None:
             d = parse_leave_date(dm.group(1))
             if d:
                 dates.append(d)
-        return (person, dates) if dates else None
+        return (person, dates, leave_type) if dates else None
 
     return None
 
@@ -544,6 +573,12 @@ def classify_command_fallback(text: str) -> dict:
 
     if lo in ["/ดูวันลา", "/วันลา", "/รายการลา", "/ลาทั้งหมด"]:
         return {"intent": "list_leaves", "content": ""}
+
+    # /ลาเช้า และ /ลาบ่าย เป็น shortcut — prepend keyword ให้ parser
+    for p, kw in [("/ลาบ่ายครึ่ง", "ครึ่งบ่าย"), ("/ลาเช้าครึ่ง", "ครึ่งเช้า"),
+                  ("/ลาบ่าย", "บ่าย"), ("/ลาเช้า", "เช้า")]:
+        if lo.startswith(p):
+            return {"intent": "add_leave", "content": kw + " " + t[len(p):].strip()}
 
     for p in ["/แจ้งลา", "/ลางาน", "/ลา"]:
         if lo.startswith(p):
@@ -830,9 +865,11 @@ HELP_TEXT = """คำสั่งที่ใช้ได้ (พิมพ์ / 
 /ล้างงานทั้งหมด
 
 🏖️ วันลา:
-/ลา ตะไค้ 27/4/69          ← 1 วัน (พ.ศ. 2 หลัก)
-/ลา ตะไค้ 12 13 14 พฤษภา  ← หลายวัน + ชื่อเดือนไทย
-/ลา ตะไค้ 12-14 พฤษภา 69  ← ช่วงวัน + เดือนไทย + ปี
+/ลา ตะไค้ 27/4/69          ← เต็มวัน
+/ลาเช้า ตะไค้ 27/4/69      ← ครึ่งเช้า
+/ลาบ่าย ตะไค้ 27/4/69      ← ครึ่งบ่าย
+/ลา ตะไค้ 12-14 พฤษภา 69  ← ช่วงวัน (range)
+/ลา ตะไค้ 12 13 14 พฤษภา  ← หลายวัน
 /ดูวันลา                    ← ดูวันลาทั้งหมด
 /ลบวันลา ตะไค้              ← ลบ/แก้ไขวันลา
 
@@ -969,27 +1006,29 @@ def handle_add_leave(content: str) -> str:
     if not content.strip():
         return ("กรุณาระบุชื่อและวันลา\n"
                 "ตัวอย่าง:\n"
-                "  /ลา ตะไค้ 27/4/69\n"
-                "  /ลา ตะไค้ 12 13 14 พฤษภา\n"
-                "  /ลา ตะไค้ 12-14 พฤษภา 69")
+                "  /ลา ตะไค้ 27/4/69          ← เต็มวัน\n"
+                "  /ลาเช้า ตะไค้ 27/4/69       ← ครึ่งเช้า\n"
+                "  /ลาบ่าย ตะไค้ 27/4/69       ← ครึ่งบ่าย\n"
+                "  /ลา ตะไค้ 12-14 พฤษภา 69   ← หลายวัน")
     result = parse_leave_input(content)
     if not result:
         return ("ไม่สามารถอ่านวันที่ได้\nตัวอย่าง:\n"
                 "  /ลา ตะไค้ 27/4/69\n"
-                "  /ลา ตะไค้ 12 13 14 พฤษภา\n"
+                "  /ลาเช้า ตะไค้ 27/4/69\n"
                 "  /ลา ตะไค้ 12-14 พฤษภา 69")
-    person, dates = result
+    person, dates, leave_type = result
     for d in dates:
-        db_add_leave(person, d)
+        db_add_leave(person, d, leave_type)
 
+    type_label = f"  ({leave_type})" if leave_type != "เต็มวัน" else ""
     if len(dates) == 1:
         return (f"✅ บันทึกวันลาสำเร็จ!\n"
                 f"ชื่อ: {person}\n"
-                f"วันที่ลา: {dates[0]}\n"
+                f"วันที่ลา: {dates[0]}{type_label}\n"
                 f"ระบบแจ้งเตือนวันนั้น และลบอัตโนมัติเมื่อสิ้นวัน")
 
     day_list = "\n".join(f"  • {d}" for d in dates)
-    return (f"✅ บันทึกวันลาสำเร็จ {len(dates)} วัน!\n"
+    return (f"✅ บันทึกวันลาสำเร็จ {len(dates)} วัน!{type_label}\n"
             f"ชื่อ: {person}\n"
             f"วันที่ลา:\n{day_list}\n"
             f"ระบบแจ้งเตือนแต่ละวัน และลบอัตโนมัติเมื่อสิ้นวัน")
@@ -1001,14 +1040,21 @@ def handle_list_leaves() -> str:
         return "ยังไม่มีการแจ้งลาในระบบ\nใช้ /ลา [ชื่อ] [วันที่] เพื่อแจ้งลา"
     # จัดกลุ่มตามชื่อคน
     grouped: dict = {}
-    for _, person, leave_date in leaves:
-        grouped.setdefault(person, []).append(leave_date)
+    for _, person, leave_date, leave_type in leaves:
+        grouped.setdefault(person, []).append((leave_date, leave_type))
     lines = ["🏖️ รายการวันลาทั้งหมด:"]
-    for person, dates in grouped.items():
-        if len(dates) == 1:
-            lines.append(f"• {person}  —  {dates[0]}")
+    for person, entries in grouped.items():
+        if len(entries) == 1:
+            d, lt = entries[0]
+            suffix = f" ({lt})" if lt != "เต็มวัน" else ""
+            lines.append(f"• {person}  —  {d}{suffix}")
         else:
-            lines.append(f"• {person}  —  {', '.join(dates)}  ({len(dates)} วัน)")
+            # แสดงแต่ละวันพร้อม type
+            dates_str = ", ".join(
+                f"{d}" + (f"({lt})" if lt != "เต็มวัน" else "")
+                for d, lt in entries
+            )
+            lines.append(f"• {person}  —  {dates_str}  ({len(entries)} วัน)")
     return "\n".join(lines)
 
 
@@ -1077,8 +1123,9 @@ def send_leave_notification():
 
     lines = [f"🏖️ แจ้งเตือนวันลา — {day_th} {today}",
              "——————————————————————"]
-    for _, person, _ in leaves:
-        lines.append(f"• {person} ลางานวันนี้")
+    for _, person, _, leave_type in leaves:
+        suffix = f" ({leave_type})" if leave_type != "เต็มวัน" else ""
+        lines.append(f"• {person} ลางานวันนี้{suffix}")
     lines.append("——————————————————————")
     msg = "\n".join(lines)
 
