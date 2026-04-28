@@ -86,6 +86,13 @@ def init_db():
         )
     """)
     c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id      TEXT PRIMARY KEY,
+            display_name TEXT,
+            updated_at   TEXT
+        )
+    """)
+    c.execute("""
         CREATE TABLE IF NOT EXISTS leaves (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_name TEXT,
@@ -232,41 +239,103 @@ def db_get_all_meetings():
 
 
 # =========================
+# User Registry (cache ชื่อ LINE ไว้ใน DB)
+# =========================
+def db_upsert_user(user_id: str, display_name: str):
+    """บันทึก/อัปเดตชื่อ user"""
+    if not user_id or not display_name:
+        return
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO users (user_id, display_name, updated_at) VALUES (?, ?, ?)"
+        " ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, updated_at=excluded.updated_at",
+        (user_id, normalize_name(display_name), _now())
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_user_name(user_id: str) -> str:
+    """ดึงชื่อจาก registry"""
+    if not user_id:
+        return ""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT display_name FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
+
+def db_get_all_users() -> list:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, display_name, updated_at FROM users ORDER BY updated_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# =========================
 # LINE Profile Helper
 # =========================
 def get_display_name(user_id: str, group_id: str = "", room_id: str = "") -> str:
     """
-    ดึง display name ของ user จาก LINE API
-    รองรับ: group, room, และ 1-on-1
-    คืน normalized name หรือ "" ถ้า error
+    ดึงชื่อ LINE display name:
+    1. ลองดึงจาก LINE API (group → room → profile)
+    2. ถ้า API fail → ดึงจาก user registry (DB cache)
+    3. ถ้าได้ชื่อจาก API → อัปเดต cache อัตโนมัติ
     """
-    if not user_id or not LINE_CHANNEL_ACCESS_TOKEN:
-        print("[profile] skip — missing user_id or token")
+    if not user_id:
         return ""
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    # ลองทุก endpoint ตามลำดับ
-    endpoints = []
-    if group_id:
-        endpoints.append(f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}")
-    if room_id:
-        endpoints.append(f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}")
-    endpoints.append(f"https://api.line.me/v2/bot/profile/{user_id}")
 
-    for url in endpoints:
-        try:
-            r = requests.get(url, headers=headers, timeout=5)
-            print(f"[profile] GET {url} → {r.status_code}")
-            if r.status_code == 200:
-                raw  = r.json().get("displayName", "")
-                name = normalize_name(raw)
-                print(f"[profile] raw={raw!r} normalized={name!r}")
-                return name
-            if r.status_code == 404:
-                continue   # ลอง endpoint ถัดไป
-            print(f"[profile] error body: {r.text[:200]}")
-        except Exception as e:
-            print(f"[profile Error] {url} → {e}")
-    return ""
+    # ── ลองดึงจาก LINE API ────────────────────────────────────────────────
+    if LINE_CHANNEL_ACCESS_TOKEN:
+        headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+        endpoints = []
+        if group_id:
+            endpoints.append(("group", f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"))
+        if room_id:
+            endpoints.append(("room",  f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"))
+        endpoints.append(("profile", f"https://api.line.me/v2/bot/profile/{user_id}"))
+
+        for ep_type, url in endpoints:
+            try:
+                r = requests.get(url, headers=headers, timeout=8)
+                print(f"[profile:{ep_type}] status={r.status_code} content-type={r.headers.get('content-type','?')}")
+
+                if r.status_code == 200:
+                    # บังคับ decode UTF-8 ตรงๆ — ป้องกัน requests ตีความ encoding ผิด
+                    raw_bytes = r.content
+                    try:
+                        data = json.loads(raw_bytes.decode("utf-8"))
+                    except Exception:
+                        data = r.json()
+
+                    raw  = data.get("displayName", "")
+                    name = normalize_name(raw)
+
+                    # log codepoints เพื่อ debug ชื่อพิเศษ
+                    cps = " ".join(f"U+{ord(c):04X}" for c in name)
+                    print(f"[profile:{ep_type}] raw_bytes={raw_bytes!r}")
+                    print(f"[profile:{ep_type}] raw={raw!r}  name={name!r}  codepoints={cps}")
+
+                    if name:
+                        db_upsert_user(user_id, name)
+                    return name
+
+                # 403 = no permission for this endpoint, ลอง endpoint ถัดไป
+                print(f"[profile:{ep_type}] skip ({r.status_code}): {r.text[:80]}")
+            except Exception as e:
+                print(f"[profile:{ep_type}] exception: {e}")
+
+    # ── Fallback: ดึงจาก DB cache ─────────────────────────────────────────
+    cached = db_get_user_name(user_id)
+    if cached:
+        print(f"[profile] cache hit: {cached!r}")
+    else:
+        print(f"[profile] no name found for {user_id[:8]}...")
+    return cached
 
 
 # =========================
@@ -671,6 +740,13 @@ def classify_command_fallback(text: str) -> dict:
     if lo in ["/ตั้งกลุ่มหลัก", "/setgroup", "/ตั้งกลุ่ม"]:
         return {"intent": "set_group", "content": ""}
 
+    if lo in ["/whoami", "/ฉันคือ", "/ชื่อของฉัน"]:
+        return {"intent": "whoami", "content": ""}
+
+    for p in ["/ลงทะเบียน", "/ชื่อฉัน", "/ฉัน", "/myname"]:
+        if lo.startswith(p):
+            return {"intent": "register_name", "content": t[len(p):].strip()}
+
     return {"intent": "query", "content": t[1:].strip()}
 
 
@@ -948,6 +1024,7 @@ HELP_TEXT = """คำสั่งที่ใช้ได้ (พิมพ์ / 
 
 ⚙️ ตั้งค่า:
 /ตั้งกลุ่มหลัก  ← บอทส่งสรุปเช้าเข้ากลุ่มนี้
+/ฉัน fërň      ← ลงทะเบียนชื่อ (สำหรับชื่อพิเศษ/emoji ที่บอทอ่านไม่ได้)
 /help"""
 
 
@@ -1161,6 +1238,24 @@ def handle_list_leaves() -> str:
     return "\n".join(lines)
 
 
+def handle_register_name(user_id: str, name: str) -> str:
+    """
+    /ฉัน [ชื่อ]  — ลงทะเบียนชื่อ LINE ไว้ในระบบ
+    ใช้เมื่อ bot อ่านชื่อจาก API ไม่ได้ (ชื่อพิเศษ/emoji)
+    """
+    name = normalize_name(name.strip())
+    if not name:
+        cached = db_get_user_name(user_id)
+        if cached:
+            return f"ชื่อที่ลงทะเบียนไว้: {cached}"
+        return ("กรุณาระบุชื่อ\nตัวอย่าง: /ฉัน fërň\n"
+                "บอทจะจำชื่อนี้ไว้ใช้กับทุก command อัตโนมัติ")
+    db_upsert_user(user_id, name)
+    return (f"✅ ลงทะเบียนชื่อสำเร็จ!\n"
+            f"ชื่อ: {name}\n"
+            f"บอทจะใช้ชื่อนี้กับ /เพิ่มงาน /ลา ฯลฯ อัตโนมัติ")
+
+
 def handle_delete_leave(person_name: str) -> str:
     if not person_name.strip():
         return "กรุณาระบุชื่อ\nตัวอย่าง: /ลบวันลา ตะไค้"
@@ -1301,6 +1396,17 @@ def debug_profile():
     })
 
 
+@app.route("/debug/users", methods=["GET"])
+def debug_users():
+    """แสดง user registry ทั้งหมดใน DB"""
+    users = db_get_all_users()
+    return jsonify([
+        {"user_id": u[0], "display_name": u[1],
+         "repr": repr(u[1]), "updated_at": u[2]}
+        for u in users
+    ])
+
+
 @app.route("/debug/names", methods=["GET"])
 def debug_names():
     """แสดงชื่อทั้งหมดใน DB พร้อม repr เพื่อดู encoding"""
@@ -1408,6 +1514,28 @@ def callback():
                 def _do_add(_c=_c, _sid=_sid, _sn=_sn):
                     push_message(_sid, handle_add_task(_c, sender_name=_sn))
                 threading.Thread(target=_do_add, daemon=True).start()
+
+            elif intent == "whoami":
+                # ทดสอบอ่านชื่อ — แสดงผลตรงๆ ว่าบอทอ่านได้ไหม
+                name = get_display_name(user_id, group_id, room_id)
+                cached = db_get_user_name(user_id)
+                if name:
+                    msg = (f"บอทอ่านชื่อได้ครับ\n"
+                           f"ชื่อ LINE: {name}\n"
+                           f"user_id: {user_id[:12]}...")
+                elif cached:
+                    msg = (f"API อ่านไม่ได้ แต่มี cache\n"
+                           f"ชื่อ (cache): {cached}\n"
+                           f"user_id: {user_id[:12]}...")
+                else:
+                    msg = (f"บอทอ่านชื่อไม่ได้ครับ\n"
+                           f"user_id: {user_id[:12]}...\n"
+                           f"group_id: {(group_id or '-')[:12]}...\n\n"
+                           f"วิธีแก้: พิมพ์  /ฉัน [ชื่อ]  เพื่อลงทะเบียนชื่อแทน")
+                reply_message(reply_token, msg)
+
+            elif intent == "register_name":
+                reply_message(reply_token, handle_register_name(user_id, content))
 
             elif intent == "add_leave":
                 reply_message(reply_token, handle_add_leave(content, sender_name=sender_name))
